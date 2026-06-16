@@ -5,24 +5,27 @@ on:
 name: Test
 env:
   CACHE_GENERATION: 0
+  RUST_BACKTRACE: full
+  RUST_LIB_BACKTRACE: 1
 jobs:
+  # Note: Windows excluded - wasmtime-fiber cannot unwind panics in Windows fiber contexts
   test:
     strategy:
       matrix:
-        platform: [ubuntu-20.04, windows-2022, macos-11]
+        platform: [ubuntu-22.04, macos-14]
     runs-on: ${{ matrix.platform }}
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         submodules: true
     - name: Install Rust
       run: rustup update --no-self-update stable && rustup default stable
       shell: bash
-    - name: Add wasm32-wasi Rust target
-      run: rustup target add wasm32-wasi
+    - name: Add wasm32-wasip1 Rust target
+      run: rustup target add wasm32-wasip1
     - name: Cache cargo
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/bin/
@@ -45,23 +48,24 @@ jobs:
   # Run the trap test in an isolated job. It needs different cargo features than the usual build, so
   # it entails rebuilding the whole workspace if we combine them in a single job. This way, we
   # achieve some parallelism via Actions jobs.
+  # Note: Windows excluded - wasmtime-fiber cannot unwind panics in Windows fiber contexts
   trap-test:
     strategy:
       matrix:
-        platform: [ubuntu-20.04, windows-2022, macos-11]
+        platform: [ubuntu-22.04, macos-14]
     runs-on: ${{ matrix.platform }}
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         submodules: true
     - name: Install Rust
       run: rustup update --no-self-update stable && rustup default stable
       shell: bash
-    - name: Add wasm32-wasi Rust target
-      run: rustup target add wasm32-wasi
+    - name: Add wasm32-wasip1 Rust target
+      run: rustup target add wasm32-wasip1
     - name: Cache cargo
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/bin/
@@ -75,11 +79,49 @@ jobs:
       run: make trap-test-ci
       shell: bash
 
+  # Windows: only run unit tests and build checks (no integration tests)
+  # Integration tests execute Wasm guests which can panic, and wasmtime-fiber
+  # cannot unwind panics in Windows fiber contexts
+  test-windows:
+    runs-on: windows-2022
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: Install Rust
+      run: rustup update --no-self-update stable && rustup default stable
+      shell: bash
+    - name: Add wasm32-wasip1 Rust target
+      run: rustup target add wasm32-wasip1
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-v${{ env.CACHE_GENERATION }}-${{ hashFiles('**/Cargo.lock') }}
+    - name: Install rustfmt
+      run: rustup component add rustfmt
+      shell: bash
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+      shell: bash
+    - name: Build
+      run: cargo build --all
+      shell: bash
+    - name: Unit tests only
+      run: cargo test --lib --all
+      shell: bash
+
   package-check:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           submodules: true
       - name: Install Rust
