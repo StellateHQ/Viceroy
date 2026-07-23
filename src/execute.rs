@@ -12,6 +12,7 @@ use {
             Backends, DeviceDetection, Dictionaries, ExperimentalModule, Geolocation,
             UnknownImportBehavior,
         },
+        in_memory_cache::InMemoryCache,
         downstream::{prepare_request, DownstreamMetadata, DownstreamRequest, DownstreamResponse},
         error::{ExecutionError, NonHttpResponse},
         linking::{create_store, link_host_functions, ComponentCtx, WasmCtx},
@@ -216,6 +217,8 @@ pub struct ExecuteCtx {
     /// Optional interceptor for dynamic backend registration.
     dynamic_backend_interceptor:
         Option<Arc<dyn crate::config::DynamicBackendRegistrationInterceptor>>,
+    /// In-memory cache for testing.
+    in_memory_cache: Option<InMemoryCache>,
 }
 
 impl ExecuteCtx {
@@ -365,6 +368,7 @@ impl ExecuteCtx {
             pending_reuse: Arc::new(AsyncMutex::new(vec![])),
             endpoints_monitor: EndpointsMonitor::default(),
             dynamic_backend_interceptor: None,
+            in_memory_cache: None,
         };
 
         Ok(ExecuteCtxBuilder { inner })
@@ -948,8 +952,14 @@ impl ExecuteCtx {
                 dynamic_backend_interceptor: None,
                 // New endpoints monitor.
                 endpoints_monitor: EndpointsMonitor::default(),
+                // New in-memory cache.
+                in_memory_cache: None,
             },
         }
+    }
+
+    pub fn in_memory_cache(&self) -> Option<&InMemoryCache> {
+        self.in_memory_cache.as_ref()
     }
 
     pub fn cache(&self) -> &Arc<Cache> {
@@ -1074,6 +1084,12 @@ impl ExecuteCtxBuilder {
     /// Set the cache for this execution context.
     pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
         self.inner.cache = cache;
+        self
+    }
+
+    /// Set the in-memory cache for this execution context.
+    pub fn with_in_memory_cache(mut self, cache: InMemoryCache) -> Self {
+        self.inner.in_memory_cache = Some(cache);
         self
     }
 
