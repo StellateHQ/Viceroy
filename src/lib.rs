@@ -30,6 +30,7 @@ mod downstream;
 mod execute;
 mod framing;
 mod headers;
+mod in_memory_cache;
 mod linking;
 mod object_store;
 mod pushpin;
@@ -51,6 +52,7 @@ pub use {
         run_to_completion, EndpointListener, EndpointsMonitor, ExecuteCtx, ExecuteCtxBuilder,
         GuestHandle, GuestProfileConfig,
     },
+    in_memory_cache::InMemoryCache,
     object_store::{ObjectKey, ObjectStoreKey},
     service::ViceroyService,
     upstream::BackendConnector,
