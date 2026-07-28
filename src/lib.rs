@@ -40,7 +40,16 @@ mod streaming_body;
 mod upstream;
 pub mod wiggle_abi;
 
+pub use hyper;
 pub use {
-    error::Error, execute::ExecuteCtx, execute::GuestProfileConfig, execute::WasmFeatures,
-    service::ViceroyService, upstream::BackendConnector, wasmtime::ProfilingStrategy,
+    cache::Cache,
+    error::Error,
+    execute::{
+        run_to_completion, ExecuteCtx, ExecuteCtxBuilder,
+        GuestHandle, GuestProfileConfig, WasmFeatures,
+    },
+    object_store::{ObjectKey, ObjectStoreKey},
+    service::ViceroyService,
+    upstream::BackendConnector,
+    wasmtime::ProfilingStrategy,
 };

@@ -90,6 +90,21 @@ pub struct GuestProfileConfig {
     pub sample_period: Duration,
 }
 
+/// A handle to a running guest computation.
+pub struct GuestHandle {
+    pub(crate) handle: tokio::task::JoinHandle<Result<(), ExecutionError>>,
+}
+
+/// Wait for a guest to complete and return any error.
+pub async fn run_to_completion(guest: GuestHandle) -> Option<anyhow::Error> {
+    match guest.handle.await {
+        Ok(Ok(())) => None,
+        Ok(Err(ExecutionError::WasmTrap(e))) => Some(e),
+        Ok(Err(e)) => Some(anyhow::anyhow!("guest execution failed: {}", e)),
+        Err(e) => Some(anyhow::anyhow!("guest task panicked: {}", e)),
+    }
+}
+
 pub struct NextRequest(Option<(Box<DownstreamRequest>, Arc<ExecuteCtx>)>);
 
 impl NextRequest {
@@ -348,6 +363,56 @@ impl ExecuteCtx {
     }
 
     /// Get the engine for this execution context.
+    /// Create a fresh [`ExecuteCtxBuilder`] that reuses this context's already-compiled
+    /// engine and instance, but starts from default configuration.
+    ///
+    /// Compiling a guest module is expensive, so integration tests build one context up
+    /// front and derive a per-test context from it rather than recompiling each time.
+    pub fn to_builder(&self) -> Result<ExecuteCtxBuilder, Error> {
+        let epoch_increment_stop = Arc::new(AtomicBool::new(false));
+        let engine_clone = self.engine.clone();
+        let epoch_increment_stop_clone = epoch_increment_stop.clone();
+        let sample_period = self
+            .guest_profile_config
+            .as_ref()
+            .map(|c| c.sample_period)
+            .unwrap_or(DEFAULT_EPOCH_INTERRUPTION_PERIOD);
+        let epoch_increment_thread = Some(thread::spawn(move || {
+            while !epoch_increment_stop_clone.load(Ordering::Relaxed) {
+                thread::sleep(sample_period);
+                engine_clone.increment_epoch();
+            }
+        }));
+
+        let inner = Self {
+            engine: self.engine.clone(),
+            instance_pre: self.instance_pre.clone(),
+            acls: Acls::new(),
+            backends: Backends::default(),
+            device_detection: DeviceDetection::default(),
+            geolocation: Geolocation::default(),
+            tls_config: TlsConfig::new()?,
+            dictionaries: Dictionaries::default(),
+            config_path: None,
+            capture_logs: Arc::new(Mutex::new(std::io::stdout())),
+            log_stdout: false,
+            log_stderr: false,
+            local_pushpin_proxy_port: None,
+            next_req_id: Arc::new(AtomicU64::new(0)),
+            object_store: ObjectStores::new(),
+            secret_stores: SecretStores::new(),
+            shielding_sites: ShieldingSites::new(),
+            epoch_increment_thread,
+            epoch_increment_stop,
+            guest_profile_config: self.guest_profile_config.clone(),
+            cache: Arc::new(Cache::default()),
+            pending_reuse: Arc::new(AsyncMutex::new(vec![])),
+            fake_valid_fastly_keys: FakeValidFastlyKeys::default(),
+        };
+
+        Ok(ExecuteCtxBuilder { inner })
+    }
+
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -488,10 +553,29 @@ impl ExecuteCtx {
     /// ```
     pub async fn handle_request(
         self: Arc<Self>,
-        mut incoming_req: Request<hyper::Body>,
+        incoming_req: Request<hyper::Body>,
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Result<(Response<Body>, Option<anyhow::Error>), Error> {
+        let (resp, err, _) = self
+            .handle_request_with_handle(incoming_req, local, remote)
+            .await?;
+        Ok((resp, err))
+    }
+
+    /// As [`handle_request`][Self::handle_request], but also returns a handle to the
+    /// guest task.
+    ///
+    /// A guest keeps running after it sends a response, so anything it does afterwards —
+    /// log writes, cache inserts — is racy from the caller's point of view. Integration
+    /// tests need to await that work before asserting on it; see
+    /// [`run_to_completion`].
+    pub async fn handle_request_with_handle(
+        self: Arc<Self>,
+        mut incoming_req: Request<hyper::Body>,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Result<(Response<Body>, Option<anyhow::Error>, Option<GuestHandle>), Error> {
         let orig_req_on_upgrade = hyper::upgrade::on(&mut incoming_req);
         let (incoming_req_parts, incoming_req_body) = incoming_req.into_parts();
         let local_pushpin_proxy_port = self.local_pushpin_proxy_port;
@@ -517,7 +601,7 @@ impl ExecuteCtx {
         let backends = self.backends.clone();
         let tls_config = self.tls_config.clone();
 
-        let (resp, mut err) = self.reuse_or_spawn_guest(req, metadata).await;
+        let (resp, mut err, guest_handle) = self.reuse_or_spawn_guest(req, metadata).await;
 
         let span = info_span!("request", id = req_id);
         let _span = span.enter();
@@ -538,7 +622,7 @@ impl ExecuteCtx {
                                 "Pushpin handoff signaled, but Pushpin mode not enabled.",
                             )));
                             *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                            return Ok((resp, None));
+                            return Ok((resp, None, None));
                         }
                         Some(port) => port,
                     };
@@ -569,7 +653,7 @@ impl ExecuteCtx {
                     .await;
 
                     let (p, hyper_body) = handoff_resp.into_parts();
-                    return Ok((Response::from_parts(p, Body::from(hyper_body)), None));
+                    return Ok((Response::from_parts(p, Body::from(hyper_body)), None, None));
                 }
                 Ok(NonHttpResponse::HandoffToBackend(handoff_info)) => {
                     let backend_name = handoff_info.backend_name.clone();
@@ -584,7 +668,7 @@ impl ExecuteCtx {
                                 "Backend handoff signaled to unknown backend '{backend_name}'."
                             ))));
                             *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                            return Ok((resp, None));
+                            return Ok((resp, None, None));
                         }
                         Some(backend) => backend,
                     };
@@ -649,7 +733,7 @@ impl ExecuteCtx {
                     .await;
 
                     let (p, hyper_body) = handoff_resp.into_parts();
-                    return Ok((Response::from_parts(p, Body::from(hyper_body)), None));
+                    return Ok((Response::from_parts(p, Body::from(hyper_body)), None, None));
                 }
                 Err(e) => {
                     err = Some(e);
@@ -657,7 +741,7 @@ impl ExecuteCtx {
             }
         }
 
-        Ok((resp, err))
+        Ok((resp, err, guest_handle))
     }
 
     /// Spawn a new guest to process a request whose processing was never attempted by
@@ -670,7 +754,7 @@ impl ExecuteCtx {
         tokio::task::spawn(async move {
             let (sender, receiver) = mpsc::channel(10);
             let original = std::mem::replace(&mut downstream.sender, sender);
-            let (resp, err) = self.spawn_guest(downstream, receiver).await;
+            let (resp, err, _guest_handle) = self.spawn_guest(downstream, receiver).await;
             let resp = guest_result_to_response(resp, err);
             let _ = original.send(DownstreamResponse::Http(resp)).await;
         });
@@ -692,7 +776,7 @@ impl ExecuteCtx {
         self: Arc<Self>,
         req: Request<Body>,
         metadata: DownstreamMetadata,
-    ) -> (Response<Body>, Option<anyhow::Error>) {
+    ) -> (Response<Body>, Option<anyhow::Error>, Option<GuestHandle>) {
         let (downstream, receiver) = DownstreamRequest::new(req, metadata);
 
         let mut next_req = NextRequest(Some((Box::new(downstream), self.clone())));
@@ -705,9 +789,9 @@ impl ExecuteCtx {
                     drop(reusable);
 
                     if let Some(response) = Self::maybe_receive_response(receiver).await {
-                        return response;
+                        return (response.0, response.1, None);
                     }
-                    return (Response::default(), None);
+                    return (Response::default(), None, None);
                 }
                 Err(nr) => next_req = nr,
             }
@@ -725,7 +809,7 @@ impl ExecuteCtx {
         self: Arc<Self>,
         downstream: DownstreamRequest,
         receiver: mpsc::Receiver<DownstreamResponse>,
-    ) -> (Response<Body>, Option<anyhow::Error>) {
+    ) -> (Response<Body>, Option<anyhow::Error>, Option<GuestHandle>) {
         let active_cpu_time_us = Arc::new(AtomicU64::new(0));
 
         // Spawn a separate task to run the guest code. That allows _this_ method to return a response early
@@ -738,21 +822,27 @@ impl ExecuteCtx {
         ));
 
         if let Some(response) = Self::maybe_receive_response(receiver).await {
-            return response;
+            return (
+                response.0,
+                response.1,
+                Some(GuestHandle {
+                    handle: guest_handle,
+                }),
+            );
         }
 
         match guest_handle
             .await
             .expect("guest worker finished without panicking")
         {
-            Ok(_) => (Response::new(Body::empty()), None),
+            Ok(_) => (Response::new(Body::empty()), None, None),
             Err(ExecutionError::WasmTrap(e)) => {
                 event!(
                     Level::ERROR,
                     "There was an error handling the request {}",
                     e.to_string()
                 );
-                (anyhow_response(&e), Some(e))
+                (anyhow_response(&e), Some(e), None)
             }
             Err(e) => panic!("failed to run guest: {}", e),
         }
@@ -1010,9 +1100,12 @@ impl ExecuteCtx {
         result
     }
 
+    /// Create a fork of this execution context, sharing the engine and compiled module
+    /// but with fresh per-test state (cache, request IDs, pending reuse).
     pub fn cache(&self) -> &Arc<Cache> {
         &self.cache
     }
+
 
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
@@ -1118,6 +1211,8 @@ impl ExecuteCtxBuilder {
         self
     }
 
+    /// Set the endpoints monitor for this execution context.
+
     /// Set the path to the config for this execution context.
     pub fn with_config_path(mut self, config_path: PathBuf) -> Self {
         self.inner.config_path = Some(config_path);
@@ -1140,6 +1235,13 @@ impl ExecuteCtxBuilder {
     /// Set the stderr logging policy for this execution context.
     pub fn with_log_stderr(mut self, log_stderr: bool) -> Self {
         self.inner.log_stderr = log_stderr;
+        self
+    }
+
+    /// Share a cache with this execution context, so that cache state survives across
+    /// the separate contexts an integration test derives from one compiled module.
+    pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
+        self.inner.cache = cache;
         self
     }
 
