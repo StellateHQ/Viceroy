@@ -1,6 +1,7 @@
 mod client_cert_info;
 
 use {
+    crate::body::Body,
     hyper::{Uri, header::HeaderValue},
     std::{collections::HashMap, sync::Arc},
 };
@@ -33,6 +34,7 @@ pub struct Backend {
     pub client_cert: Option<ClientCertInfo>,
     pub ca_certs: Vec<rustls::Certificate>,
     pub health: BackendHealth,
+    pub handler: Option<Handler>,
 }
 
 /// A map of [`Backend`] definitions, keyed by their name.
@@ -222,6 +224,7 @@ mod deserialization {
                 between_bytes_timeout,
                 ca_certs,
                 health,
+                handler: None,
             })
         }
     }
@@ -277,4 +280,41 @@ mod deserialization {
             _ => Err(BackendConfigError::InvalidCACertEntry("unknown format for 'ca_certificates' field; should be a certificate string, a dictionary with a file reference, or an array of the previous".to_string())),
         }
     }
+}
+
+/// A wrapper for an in-memory backend handler.
+#[derive(Clone)]
+pub struct Handler {
+    handler: Arc<Box<dyn InMemoryBackendHandler>>,
+}
+
+impl Handler {
+    pub fn new(handler: Box<dyn InMemoryBackendHandler>) -> Self {
+        Self {
+            handler: Arc::new(handler),
+        }
+    }
+
+    pub async fn handle(&self, req: hyper::Request<Body>) -> hyper::Response<hyper::Body> {
+        self.handler.handle(req).await
+    }
+}
+
+impl std::fmt::Debug for Handler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handler")
+            .field("handler", &"opaque handler function")
+            .finish()
+    }
+}
+
+/// Trait for handling backend requests in-memory.
+#[async_trait::async_trait]
+pub trait InMemoryBackendHandler: Send + Sync + 'static {
+    async fn handle(&self, req: hyper::Request<Body>) -> hyper::Response<hyper::Body>;
+}
+
+/// Trait for intercepting dynamic backend registration.
+pub trait DynamicBackendRegistrationInterceptor: Send + Sync + 'static {
+    fn register(&self, backend: Backend) -> Backend;
 }

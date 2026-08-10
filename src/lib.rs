@@ -30,6 +30,7 @@ mod downstream;
 mod execute;
 mod handoff;
 mod http;
+mod in_memory_cache;
 mod linking;
 mod object_store;
 mod secret_store;
@@ -45,11 +46,14 @@ pub use {
     cache::Cache,
     error::Error,
     execute::{
-        run_to_completion, ExecuteCtx, ExecuteCtxBuilder,
-        GuestHandle, GuestProfileConfig, WasmFeatures,
+        EndpointListener, EndpointsMonitor, ExecuteCtx, ExecuteCtxBuilder, GuestHandle,
+        GuestProfileConfig, WasmFeatures, run_to_completion,
     },
+    in_memory_cache::InMemoryCache,
     object_store::{ObjectKey, ObjectStoreKey},
     service::ViceroyService,
     upstream::BackendConnector,
     wasmtime::ProfilingStrategy,
 };
+
+pub use async_trait;

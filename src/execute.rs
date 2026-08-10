@@ -10,13 +10,14 @@ use {
         cache::Cache,
         component as compute,
         config::{
-            Backends, DeviceDetection, Dictionaries, ExperimentalModule, FakeValidFastlyKeys,
-            Geolocation, UnknownImportBehavior,
+            Backends, DeviceDetection, Dictionaries, DynamicBackendRegistrationInterceptor,
+            ExperimentalModule, FakeValidFastlyKeys, Geolocation, UnknownImportBehavior,
         },
         downstream::{DownstreamMetadata, DownstreamRequest, DownstreamResponse, prepare_request},
         error::{ExecutionError, NonHttpResponse},
         handoff::{HandoffConfig, HandoffRequestInfo, HandoffTlsConfig, perform_handoff},
         http::framing::apply_response_framing,
+        in_memory_cache::InMemoryCache,
         linking::{ComponentCtx, WasmCtx, create_store, link_host_functions},
         object_store::ObjectStores,
         sandbox::Sandbox,
@@ -32,21 +33,21 @@ use {
     hyper::{Request, Response},
     pin_project::pin_project,
     std::{
-        collections::HashSet,
+        collections::{BTreeMap, HashSet},
         fmt, fs,
         io::Write,
         net::{Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         pin::Pin,
         sync::{
-            Arc, Mutex,
+            Arc, Mutex, RwLock,
             atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread::{self, JoinHandle},
         time::{Duration, Instant, SystemTime},
     },
     tokio::sync::Mutex as AsyncMutex,
-    tokio::sync::mpsc,
+    tokio::sync::mpsc::{self, Receiver, Sender as MpscSender},
     tokio::sync::oneshot::{self, Sender},
     tracing::{Instrument, Level, error, event, info, info_span, warn},
     wasmtime::{
@@ -93,6 +94,38 @@ pub struct GuestProfileConfig {
 /// A handle to a running guest computation.
 pub struct GuestHandle {
     pub(crate) handle: tokio::task::JoinHandle<Result<(), ExecutionError>>,
+}
+
+/// A monitor for logging endpoints used by integration tests.
+#[derive(Clone, Default)]
+pub struct EndpointsMonitor {
+    pub endpoints: Arc<RwLock<BTreeMap<Vec<u8>, MpscSender<Vec<u8>>>>>,
+}
+
+impl EndpointsMonitor {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn register_listener<T: Into<Vec<u8>>>(&self, name: T) -> EndpointListener {
+        let (sender, receiver) = mpsc::channel(100);
+        self.endpoints.write().unwrap().insert(name.into(), sender);
+        EndpointListener { receiver }
+    }
+}
+
+pub struct EndpointListener {
+    receiver: Receiver<Vec<u8>>,
+}
+
+impl EndpointListener {
+    pub fn messages(&mut self) -> Vec<Vec<u8>> {
+        let mut messages = Vec::new();
+        while let Ok(message) = self.receiver.try_recv() {
+            messages.push(message);
+        }
+        messages
+    }
 }
 
 /// Wait for a guest to complete and return any error.
@@ -183,6 +216,9 @@ pub struct ExecuteCtx {
     epoch_increment_stop: Arc<AtomicBool>,
     /// Configuration for guest profiling if enabled
     guest_profile_config: Option<Arc<GuestProfileConfig>>,
+    endpoints_monitor: EndpointsMonitor,
+    in_memory_cache: InMemoryCache,
+    dynamic_backend_interceptor: Option<Arc<Box<dyn DynamicBackendRegistrationInterceptor>>>,
 }
 
 impl ExecuteCtx {
@@ -335,6 +371,9 @@ impl ExecuteCtx {
             guest_profile_config: guest_profile_config.map(Arc::new),
             cache: Arc::new(Cache::default()),
             pending_reuse: Arc::new(AsyncMutex::new(vec![])),
+            endpoints_monitor: EndpointsMonitor::new(),
+            in_memory_cache: InMemoryCache::new(),
+            dynamic_backend_interceptor: None,
         };
 
         Ok(ExecuteCtxBuilder { inner })
@@ -408,6 +447,9 @@ impl ExecuteCtx {
             cache: Arc::new(Cache::default()),
             pending_reuse: Arc::new(AsyncMutex::new(vec![])),
             fake_valid_fastly_keys: FakeValidFastlyKeys::default(),
+            endpoints_monitor: EndpointsMonitor::new(),
+            in_memory_cache: InMemoryCache::new(),
+            dynamic_backend_interceptor: None,
         };
 
         Ok(ExecuteCtxBuilder { inner })
@@ -415,6 +457,24 @@ impl ExecuteCtx {
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    pub async fn run_to_completion(handle: GuestHandle) -> Option<anyhow::Error> {
+        run_to_completion(handle).await
+    }
+
+    pub fn dynamic_backend_interceptor(
+        &self,
+    ) -> Option<Arc<Box<dyn DynamicBackendRegistrationInterceptor>>> {
+        self.dynamic_backend_interceptor.clone()
+    }
+
+    pub fn endpoints_monitor(&self) -> &EndpointsMonitor {
+        &self.endpoints_monitor
+    }
+
+    pub fn in_memory_cache(&self) -> &InMemoryCache {
+        &self.in_memory_cache
     }
 
     /// Get the acls for this execution context.
@@ -1106,7 +1166,6 @@ impl ExecuteCtx {
         &self.cache
     }
 
-
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
     }
@@ -1164,6 +1223,25 @@ impl ExecuteCtxBuilder {
     /// Set the backends for this execution context.
     pub fn with_backends(mut self, backends: Backends) -> Self {
         self.inner.backends = backends;
+        self
+    }
+
+    pub fn with_endpoints(mut self, endpoints: EndpointsMonitor) -> Self {
+        self.inner.endpoints_monitor = endpoints;
+        self
+    }
+
+    pub fn with_in_memory_cache(mut self, cache: InMemoryCache) -> Self {
+        self.inner.cache = cache.0.clone();
+        self.inner.in_memory_cache = cache;
+        self
+    }
+
+    pub fn with_dynamic_backend_interceptor(
+        mut self,
+        interceptor: Box<dyn DynamicBackendRegistrationInterceptor>,
+    ) -> Self {
+        self.inner.dynamic_backend_interceptor = Some(Arc::new(interceptor));
         self
     }
 
@@ -1240,8 +1318,9 @@ impl ExecuteCtxBuilder {
 
     /// Share a cache with this execution context, so that cache state survives across
     /// the separate contexts an integration test derives from one compiled module.
-    pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
-        self.inner.cache = cache;
+    pub fn with_cache(mut self, cache: InMemoryCache) -> Self {
+        self.inner.cache = cache.0.clone();
+        self.inner.in_memory_cache = cache;
         self
     }
 

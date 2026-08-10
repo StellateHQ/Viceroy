@@ -348,40 +348,45 @@ pub fn send_request(
     *req.uri_mut() = uri;
 
     let h2only = backend.grpc;
+    let handler = backend.handler.clone();
     let first_byte_timeout = backend.first_byte_timeout;
     let between_bytes_timeout = backend.between_bytes_timeout;
     let backend_name = backend_name.to_string();
     let backend_uri = backend.uri.to_string();
     async move {
-        let mut builder = Client::builder();
-
-        if req.version() == Version::HTTP_2 {
-            builder.http2_only(true);
-        }
-
         let is_pass = req
             .extensions()
             .get::<CacheOverride>()
             .map(CacheOverride::is_pass)
             .unwrap_or_default();
 
-        let client = builder.set_host(false).http2_only(h2only).build(connector);
+        let mut basic_response = if let Some(handler) = handler {
+            handler.handle(req).await
+        } else {
+            let mut builder = Client::builder();
 
-        let mut basic_response = match first_byte_timeout {
-            None => client.request(req).await,
-            Some(timeout) => tokio::time::timeout(timeout, client.request(req))
-                .await
-                .map_err(Error::FirstByteTimeout)?,
-        }
-        .map_err(|source| {
-            let err = Error::BackendConnectionError {
-                backend_name: backend_name.clone(),
-                uri: backend_uri.clone(),
-                source,
-            };
-            tracing::error!("{}", err);
-            err
-        })?;
+            if req.version() == Version::HTTP_2 {
+                builder.http2_only(true);
+            }
+
+            let client = builder.set_host(false).http2_only(h2only).build(connector);
+
+            match first_byte_timeout {
+                None => client.request(req).await,
+                Some(timeout) => tokio::time::timeout(timeout, client.request(req))
+                    .await
+                    .map_err(Error::FirstByteTimeout)?,
+            }
+            .map_err(|source| {
+                let err = Error::BackendConnectionError {
+                    backend_name: backend_name.clone(),
+                    uri: backend_uri.clone(),
+                    source,
+                };
+                tracing::error!("{}", err);
+                err
+            })?
+        };
 
         if let Some(md) = basic_response.extensions_mut().get_mut::<ConnMetadata>() {
             // This is used later to create similar behaviour between Compute and Viceroy.

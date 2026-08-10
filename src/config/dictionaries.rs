@@ -2,11 +2,43 @@ use {
     crate::error::DictionaryConfigError,
     std::{
         collections::HashMap,
-        fs,
+        fmt, fs,
         path::{Path, PathBuf},
         sync::Arc,
     },
 };
+
+/// A wrapper type for dictionary names used by integration tests.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct DictionaryName(String);
+
+impl DictionaryName {
+    pub fn new(name: String) -> Self {
+        Self(name)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DictionaryName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for DictionaryName {
+    fn from(name: String) -> Self {
+        Self(name)
+    }
+}
+
+impl From<&str> for DictionaryName {
+    fn from(name: &str) -> Self {
+        Self(name.to_owned())
+    }
+}
 
 /// A single Dictionary definition.
 ///

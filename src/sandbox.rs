@@ -607,7 +607,18 @@ impl Sandbox {
         if let Some(handle) = self.log_endpoints_by_name.get(name).copied() {
             return handle;
         }
-        let endpoint = LogEndpoint::new(name, self.capture_logs.clone());
+        let mut endpoint = LogEndpoint::new(name, self.capture_logs.clone());
+        if let Some(sender) = self
+            .ctx
+            .endpoints_monitor()
+            .endpoints
+            .read()
+            .unwrap()
+            .get(name)
+            .cloned()
+        {
+            endpoint = endpoint.with_channel(sender);
+        }
         let handle = self.log_endpoints.push(endpoint);
         self.log_endpoints_by_name.insert(name.to_owned(), handle);
         handle
@@ -672,6 +683,12 @@ impl Sandbox {
         if self.backends().contains_key(name) || self.dynamic_backends.contains_key(name) {
             return false;
         }
+
+        let info = if let Some(interceptor) = self.ctx.dynamic_backend_interceptor() {
+            interceptor.register(info)
+        } else {
+            info
+        };
 
         self.dynamic_backends
             .insert(name.to_string(), Arc::new(info));
