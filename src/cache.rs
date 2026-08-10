@@ -87,6 +87,10 @@ pub struct CacheKey(
 impl CacheKey {
     /// The maximum size of a cache key is 4KiB.
     pub const MAX_LENGTH: usize = 4096;
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl TryFrom<&Vec<u8>> for CacheKey {
@@ -468,6 +472,12 @@ const MAX_SURROGATE_KEY_LENGTH: usize = 1024;
 
 #[derive(Debug, Default, Clone)]
 pub struct SurrogateKeySet(HashSet<SurrogateKey>);
+
+impl SurrogateKeySet {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SurrogateKey> {
+        self.0.iter()
+    }
+}
 
 impl std::fmt::Display for SurrogateKeySet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -38,6 +38,12 @@ impl FastlyHttpBody for Sandbox {
                 dest.send_chunk(chunk).await?;
             }
             dest.trailers.extend(trailers);
+        } else if self.is_caching_body(dest) {
+            let cache_handle = self.caching_body_handle(dest)?;
+            let source_bytes = src.read_into_vec().await?;
+            self.in_memory_cache()
+                .legacy()
+                .append_body(cache_handle, &source_bytes)?;
         } else {
             let dest = self.body_mut(dest)?;
             dest.trailers.extend(trailers);
@@ -91,6 +97,11 @@ impl FastlyHttpBody for Sandbox {
                     self.streaming_body_mut(body_handle)?
                         .send_chunk(buf)
                         .await?;
+                } else if self.is_caching_body(body_handle) {
+                    let cache_handle = self.caching_body_handle(body_handle)?;
+                    self.in_memory_cache()
+                        .legacy()
+                        .append_body(cache_handle, buf)?;
                 } else {
                     self.body_mut(body_handle)?.push_back(buf);
                 }

@@ -152,6 +152,7 @@ impl PendingCacheTask {
 #[derive(Debug)]
 pub enum AsyncItem {
     Body(Body),
+    CachingBody(crate::wiggle_abi::types::CacheHandle),
     StreamingBody(StreamingBody),
     PendingReq(PendingResponse),
     PendingDownstream(PendingDownstreamReqTask),
@@ -166,6 +167,17 @@ pub enum AsyncItem {
 impl AsyncItem {
     pub fn is_streaming(&self) -> bool {
         matches!(self, Self::StreamingBody(_))
+    }
+
+    pub fn is_caching(&self) -> bool {
+        matches!(self, Self::CachingBody(_))
+    }
+
+    pub fn caching_handle(&self) -> Option<crate::wiggle_abi::types::CacheHandle> {
+        match self {
+            Self::CachingBody(handle) => Some(*handle),
+            _ => None,
+        }
     }
 
     pub fn as_body(&self) -> Option<&Body> {
@@ -336,6 +348,7 @@ impl AsyncItem {
         match self {
             Self::StreamingBody(body) => body.await_ready().await,
             Self::Body(body) => body.await_ready().await,
+            Self::CachingBody(_) => (),
             Self::PendingReq(req) => req.await_ready().await,
             Self::PendingDownstream(req) => req.await_ready().await,
             Self::PendingKvLookup(req) => req.0.await_ready().await,

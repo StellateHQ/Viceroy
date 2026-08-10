@@ -1,5 +1,4 @@
 use core::str;
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -7,7 +6,8 @@ use http::HeaderMap;
 
 use crate::body::Body;
 use crate::cache::{CacheKey, SurrogateKeySet, VaryRule, WriteOptions};
-use crate::sandbox::{PeekableTask, PendingCacheTask, Sandbox};
+use crate::error::HandleError;
+use crate::sandbox::Sandbox;
 use crate::wiggle_abi::types::CacheWriteOptionsMask;
 
 use super::fastly_cache::FastlyCache;
@@ -191,18 +191,12 @@ impl FastlyCache for Sandbox {
             always_use_requested_range,
         } = load_lookup_options(self, memory, options_mask, options)?;
         let key = load_cache_key(memory, cache_key)?;
-        let cache = Arc::clone(self.cache());
-
-        let task = PeekableTask::spawn(Box::pin(async move {
-            Ok(cache
-                .lookup(&key, &headers)
-                .await
-                .with_always_use_requested_range(always_use_requested_range))
-        }))
-        .await;
-        let task = PendingCacheTask::new(task);
-        let handle = self.insert_cache_op(task);
-        Ok(handle.into())
+        let handle = self
+            .in_memory_cache()
+            .legacy()
+            .get_entry(key.as_bytes(), &headers)
+            .unwrap_or(crate::in_memory_cache::not_found_handle());
+        Ok(handle)
     }
 
     async fn insert(
@@ -215,27 +209,22 @@ impl FastlyCache for Sandbox {
         let key = load_cache_key(memory, cache_key)?;
         let guest_options = memory.read(options)?;
 
-        // This is the only method that accepts REQUEST_HEADERS in the options mask.
-        let request_headers = if options_mask.contains(CacheWriteOptionsMask::REQUEST_HEADERS) {
-            let handle = guest_options.request_headers;
-            let parts = self.request_parts(handle)?;
-            parts.headers.clone()
-        } else {
-            HeaderMap::default()
-        };
         let options = load_write_options(
             memory,
             options_mask & !CacheWriteOptionsMask::REQUEST_HEADERS,
             &guest_options,
         )?;
-        let cache = Arc::clone(self.cache());
-
-        let handle = self.insert_body(Body::empty());
-        let read_body = self.begin_streaming(handle)?;
-        cache
-            .insert(&key, request_headers, options, read_body)
-            .await;
-        Ok(handle)
+        let handle = self.in_memory_cache().legacy().insert(
+            key.as_bytes().to_vec(),
+            options_mask,
+            &options,
+            if options_mask.contains(CacheWriteOptionsMask::REQUEST_HEADERS) {
+                Some(self.request_parts(guest_options.request_headers)?)
+            } else {
+                None
+            },
+        )?;
+        Ok(self.insert_cache_body(handle))
     }
 
     async fn replace(
@@ -334,10 +323,13 @@ impl FastlyCache for Sandbox {
         options_mask: types::CacheLookupOptionsMask,
         options: wiggle::GuestPtr<types::CacheLookupOptions>,
     ) -> Result<types::CacheHandle, Error> {
-        let h = self
-            .transaction_lookup_async(memory, cache_key, options_mask, options)
-            .await?;
-        self.cache_busy_handle_wait(memory, h).await
+        let LookupOptions { headers, .. } =
+            load_lookup_options(self, memory, options_mask, options)?;
+        let key = load_cache_key(memory, cache_key)?;
+        Ok(self
+            .in_memory_cache()
+            .legacy()
+            .transaction_lookup(key.as_bytes().to_vec(), &headers))
     }
 
     async fn transaction_lookup_async(
@@ -347,36 +339,14 @@ impl FastlyCache for Sandbox {
         options_mask: types::CacheLookupOptionsMask,
         options: wiggle::GuestPtr<types::CacheLookupOptions>,
     ) -> Result<types::CacheBusyHandle, Error> {
-        let LookupOptions {
-            headers,
-            always_use_requested_range,
-        } = load_lookup_options(self, memory, options_mask, options)?;
+        let LookupOptions { headers, .. } =
+            load_lookup_options(self, memory, options_mask, options)?;
         let key = load_cache_key(memory, cache_key)?;
-        let cache = Arc::clone(self.cache());
-
-        // Look up once, joining the transaction only if obligated:
-        let e = cache
-            .transaction_lookup(&key, &headers, false)
-            .await
-            .with_always_use_requested_range(always_use_requested_range);
-        let ready = e.found().is_some() || e.go_get().is_some();
-        // If we already got _something_, we can provide an already-complete PeekableTask.
-        // Otherwise we need to spawn it and let it block in the background.
-        let task = if ready {
-            PeekableTask::complete(e)
-        } else {
-            PeekableTask::spawn(Box::pin(async move {
-                Ok(cache
-                    .transaction_lookup(&key, &headers, true)
-                    .await
-                    .with_always_use_requested_range(always_use_requested_range))
-            }))
-            .await
-        };
-
-        let task = PendingCacheTask::new(task);
-        let handle = self.insert_cache_op(task);
-        Ok(handle.into())
+        let handle = self
+            .in_memory_cache()
+            .legacy()
+            .transaction_lookup(key.as_bytes().to_vec(), &headers);
+        Ok(types::CacheBusyHandle::from(u32::from(handle)))
     }
 
     async fn cache_busy_handle_wait(
@@ -384,13 +354,7 @@ impl FastlyCache for Sandbox {
         memory: &mut wiggle::GuestMemory<'_>,
         handle: types::CacheBusyHandle,
     ) -> Result<types::CacheHandle, Error> {
-        let handle = handle.into();
-        // Swap out for a distinct handle, so we don't hit a repeated `close`+`close_busy`:
-        let entry = self.cache_entry_mut(handle).await?;
-        let mut other_entry = entry.stub();
-        std::mem::swap(entry, &mut other_entry);
-        let task = PeekableTask::spawn(Box::pin(async move { Ok(other_entry) })).await;
-        Ok(self.insert_cache_op(PendingCacheTask::new(task)).into())
+        Ok(handle.into())
     }
 
     async fn transaction_insert(
@@ -403,8 +367,7 @@ impl FastlyCache for Sandbox {
         let (body, cache_handle) = self
             .transaction_insert_and_stream_back(memory, handle, options_mask, options)
             .await?;
-        // Ignore the "stream back" handle
-        let _ = self.take_cache_entry(cache_handle)?;
+        let _ = cache_handle;
         Ok(body)
     }
 
@@ -416,25 +379,22 @@ impl FastlyCache for Sandbox {
         options: wiggle::GuestPtr<types::CacheWriteOptions>,
     ) -> Result<(types::BodyHandle, types::CacheHandle), Error> {
         let guest_options = memory.read(options)?;
-        // No request headers here; request headers come from the original lookup.
-        if options_mask.contains(CacheWriteOptionsMask::REQUEST_HEADERS) {
-            return Err(Error::InvalidArgument);
-        }
+        let key = self
+            .in_memory_cache()
+            .legacy()
+            .pending_key(handle)
+            .ok_or(HandleError::InvalidCacheHandle(handle))?;
+        let request_parts = if options_mask.contains(CacheWriteOptionsMask::REQUEST_HEADERS) {
+            Some(self.request_parts(guest_options.request_headers)?)
+        } else {
+            None
+        };
         let options = load_write_options(memory, options_mask, &guest_options)?;
-
-        // Optimistically start a body, so we don't have to reborrow &mut self
-        let body_handle = self.insert_body(Body::empty());
-        let read_body = self.begin_streaming(body_handle)?;
-
-        let e = self
-            .cache_entry_mut(handle)
-            .await?
-            .insert(options, read_body)?;
-
-        // Return a new handle for the read end.
-        let handle = self.insert_cache_op(PendingCacheTask::new(PeekableTask::complete(e)));
-
-        Ok((body_handle, handle.into()))
+        let cache_handle =
+            self.in_memory_cache()
+                .legacy()
+                .insert(key, options_mask, &options, request_parts)?;
+        Ok((self.insert_cache_body(cache_handle), cache_handle))
     }
 
     async fn transaction_update(
@@ -444,20 +404,7 @@ impl FastlyCache for Sandbox {
         options_mask: types::CacheWriteOptionsMask,
         options: wiggle::GuestPtr<types::CacheWriteOptions>,
     ) -> Result<(), Error> {
-        let guest_options = memory.read(options)?;
-        // No request headers here; request headers come from the original lookup.
-        if options_mask.contains(CacheWriteOptionsMask::REQUEST_HEADERS) {
-            return Err(Error::InvalidArgument);
-        }
-        let options = load_write_options(memory, options_mask, &guest_options)?;
-
-        let entry = self.cache_entry_mut(handle).await?;
-        // The path here is:
-        // InvalidCacheHandle -> FastlyStatus::BADF -> (ABI boundary) ->
-        // CacheError::InvalidOperation
-        entry.update(options).await?;
-
-        Ok(())
+        Err(Error::NotAvailable("cache transaction update"))
     }
 
     async fn transaction_cancel(
@@ -465,11 +412,15 @@ impl FastlyCache for Sandbox {
         memory: &mut wiggle::GuestMemory<'_>,
         handle: types::CacheHandle,
     ) -> Result<(), Error> {
-        let entry = self.cache_entry_mut(handle).await?;
-        if entry.cancel() {
+        if self
+            .in_memory_cache()
+            .legacy()
+            .pending_key(handle)
+            .is_some()
+        {
             Ok(())
         } else {
-            Err(Error::CacheError(crate::cache::Error::CannotWrite))
+            Err(HandleError::InvalidCacheHandle(handle).into())
         }
     }
 
@@ -478,8 +429,6 @@ impl FastlyCache for Sandbox {
         memory: &mut wiggle::GuestMemory<'_>,
         handle: types::CacheBusyHandle,
     ) -> Result<(), Error> {
-        // Don't wait for the transaction to complete; drop the future to cancel.
-        let _ = self.take_cache_entry(handle.into())?;
         Ok(())
     }
 
@@ -488,7 +437,6 @@ impl FastlyCache for Sandbox {
         memory: &mut wiggle::GuestMemory<'_>,
         handle: types::CacheHandle,
     ) -> Result<(), Error> {
-        let _ = self.take_cache_entry(handle)?.task().recv().await?;
         Ok(())
     }
 
@@ -497,23 +445,18 @@ impl FastlyCache for Sandbox {
         memory: &mut wiggle::GuestMemory<'_>,
         handle: types::CacheHandle,
     ) -> Result<types::CacheLookupState, Error> {
-        let entry = self.cache_entry_mut(handle).await?;
-
         let mut state = types::CacheLookupState::empty();
-        if let Some(found) = entry.found() {
-            // At the moment, Compute only returns FOUND if the object is fresh.
-            // We adopt the same behavior here, as SDKs (including old SDK versions) do not check
-            // the USABLE bit.
-            if found.meta().is_usable() {
-                state |= types::CacheLookupState::USABLE;
-                state |= types::CacheLookupState::FOUND;
-
-                if !found.meta().is_fresh() {
-                    state |= types::CacheLookupState::STALE;
-                }
+        if let Ok(entry) = self.in_memory_cache().legacy().entry(handle) {
+            state |= types::CacheLookupState::FOUND;
+            if entry.is_stale() {
+                state |= types::CacheLookupState::STALE;
             }
-        }
-        if entry.go_get().is_some() {
+            if entry.is_usable() {
+                state |= types::CacheLookupState::USABLE;
+            } else {
+                state |= types::CacheLookupState::MUST_INSERT_OR_UPDATE;
+            }
+        } else {
             state |= types::CacheLookupState::MUST_INSERT_OR_UPDATE;
         }
 
@@ -528,12 +471,7 @@ impl FastlyCache for Sandbox {
         user_metadata_out_len: u32,
         nwritten_out: wiggle::GuestPtr<u32>,
     ) -> Result<(), Error> {
-        let entry = self.cache_entry(handle).await?;
-
-        let md_bytes = entry
-            .found()
-            .map(|found| found.meta().user_metadata())
-            .ok_or(crate::Error::CacheError(crate::cache::Error::Missing))?;
+        let md_bytes = self.in_memory_cache().legacy().entry(handle)?.user_metadata;
         let len: u32 = md_bytes
             .len()
             .try_into()
@@ -586,35 +524,15 @@ impl FastlyCache for Sandbox {
         // We have an exclusive borrow &mut self.sandbox for the lifetime of this call,
         // so even though we're re-borrowing/repeating lookups, we know we won't run into TOCTOU.
 
-        let entry = self.cache_entry(handle).await?;
-
-        // Preemptively (optimistically) start a read. Don't worry, the Drop impl for Body will
-        // clean up the copying task.
-        // We have to do this to allow `found`'s lifetime to end before self.sandbox.body, which
-        // has to re-borrow self.self.sandbox.
-        let body = entry.body(from, to).await?;
-
-        let found = entry
-            .found()
-            .ok_or(Error::CacheError(crate::cache::Error::Missing))?;
-
-        if let Some(prev_handle) = found.last_body_handle {
-            // Check if they're still reading the previous handle.
-            if self.body(prev_handle).is_ok() {
-                return Err(Error::CacheError(crate::cache::Error::HandleBodyUsed));
-            }
-        };
-
-        let body_handle = self.insert_body(body);
-        // Finalize by committing the handle as "the last read".
-        // We have to borrow `found` again, this time as mutable.
-        self.cache_entry_mut(handle)
-            .await?
-            .found_mut()
-            .unwrap()
-            .last_body_handle = Some(body_handle);
-
-        Ok(body_handle)
+        let mut body = self.in_memory_cache().legacy().body(handle)?;
+        let from = from.unwrap_or(0) as usize;
+        let to = to.map(|to| to as usize).unwrap_or(body.len());
+        if from > to || from > body.len() {
+            body.clear();
+        } else {
+            body = body[from..std::cmp::min(to, body.len())].to_vec();
+        }
+        Ok(self.insert_body(Body::from(body)))
     }
 
     async fn get_length(
@@ -622,14 +540,7 @@ impl FastlyCache for Sandbox {
         memory: &mut wiggle::GuestMemory<'_>,
         handle: types::CacheHandle,
     ) -> Result<types::CacheObjectLength, Error> {
-        let found = self
-            .cache_entry(handle)
-            .await?
-            .found()
-            .ok_or(Error::CacheError(crate::cache::Error::Missing))?;
-        found
-            .length()
-            .ok_or(Error::CacheError(crate::cache::Error::Missing))
+        Ok(self.in_memory_cache().legacy().body(handle)?.len() as u64)
     }
 
     async fn get_max_age_ns(
@@ -637,12 +548,12 @@ impl FastlyCache for Sandbox {
         memory: &mut wiggle::GuestMemory<'_>,
         handle: types::CacheHandle,
     ) -> Result<types::CacheDurationNs, Error> {
-        let entry = self.cache_entry_mut(handle).await?;
-        if let Some(found) = entry.found() {
-            Ok(found.meta().max_age().as_nanos().try_into().unwrap())
-        } else {
-            Err(Error::CacheError(crate::cache::Error::Missing))
-        }
+        Ok(self
+            .in_memory_cache()
+            .legacy()
+            .entry(handle)?
+            .max_age_ns
+            .unwrap_or_default())
     }
 
     async fn get_stale_while_revalidate_ns(
@@ -650,7 +561,12 @@ impl FastlyCache for Sandbox {
         memory: &mut wiggle::GuestMemory<'_>,
         handle: types::CacheHandle,
     ) -> Result<types::CacheDurationNs, Error> {
-        Err(Error::NotAvailable("Cache API primitives"))
+        Ok(self
+            .in_memory_cache()
+            .legacy()
+            .entry(handle)?
+            .swr_ns
+            .unwrap_or_default())
     }
 
     async fn get_age_ns(
@@ -658,12 +574,7 @@ impl FastlyCache for Sandbox {
         memory: &mut wiggle::GuestMemory<'_>,
         handle: types::CacheHandle,
     ) -> Result<types::CacheDurationNs, Error> {
-        let entry = self.cache_entry_mut(handle).await?;
-        if let Some(found) = entry.found() {
-            Ok(found.meta().age().as_nanos().try_into().unwrap())
-        } else {
-            Err(Error::CacheError(crate::cache::Error::Missing))
-        }
+        Ok(self.in_memory_cache().legacy().entry(handle)?.age_ns())
     }
 
     async fn get_hits(

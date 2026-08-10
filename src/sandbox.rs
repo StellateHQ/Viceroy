@@ -320,6 +320,27 @@ impl Sandbox {
         self.async_items.push(Some(AsyncItem::Body(body))).into()
     }
 
+    pub fn insert_cache_body(&mut self, handle: CacheHandle) -> BodyHandle {
+        self.async_items
+            .push(Some(AsyncItem::CachingBody(handle)))
+            .into()
+    }
+
+    pub fn is_caching_body(&self, handle: BodyHandle) -> bool {
+        self.async_items
+            .get(handle.into())
+            .and_then(Option::as_ref)
+            .is_some_and(AsyncItem::is_caching)
+    }
+
+    pub fn caching_body_handle(&self, handle: BodyHandle) -> Result<CacheHandle, HandleError> {
+        self.async_items
+            .get(handle.into())
+            .and_then(Option::as_ref)
+            .and_then(AsyncItem::caching_handle)
+            .ok_or(HandleError::InvalidBodyHandle(handle))
+    }
+
     /// Get a reference to a [`Body`][body], given its [`BodyHandle`][handle].
     ///
     /// Returns a [`HandleError`][err] if the handle is not associated with a body in the sandbox.
@@ -1175,6 +1196,10 @@ impl Sandbox {
     /// Access the cache.
     pub fn cache(&self) -> &Arc<Cache> {
         self.ctx.cache()
+    }
+
+    pub fn in_memory_cache(&self) -> &crate::InMemoryCache {
+        self.ctx.in_memory_cache()
     }
 
     // -------- Scheduling APIs ----------
